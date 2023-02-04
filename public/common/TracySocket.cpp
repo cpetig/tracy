@@ -10,7 +10,9 @@
 #include "TracySocket.hpp"
 #include "TracySystem.hpp"
 
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+#  include <emscripten/websocket.h>
+#elif defined _WIN32
 #  ifndef NOMINMAX
 #    define NOMINMAX
 #  endif
@@ -99,17 +101,108 @@ Socket::~Socket()
     }
     if( m_ptr )
     {
+#ifndef __EMSCRIPTEN__
         freeaddrinfo( m_res );
 #ifdef _WIN32
         closesocket( m_connSock );
 #else
         close( m_connSock );
 #endif
+#endif
     }
 }
 
+#ifdef __EMSCRIPTEN__
+static EMSCRIPTEN_WEBSOCKET_T webs_active_socket = 0;
+static bool webs_connected = false;
+static bool webs_closed = false;
+
+namespace {
+template <unsigned SIZE>
+class Fifo {
+    uint8_t buffer[SIZE];
+    uint32_t read_pos;
+    uint32_t write_pos;
+    // for ease of implementation read_pos==write_pos is empty
+    // and write_pos == read_pos-1 is full
+
+public:
+    Fifo() : read_pos(), write_pos() {}
+
+    bool push(uint8_t value) {
+        uint32_t next = (write_pos + 1)%SIZE;
+        if (next == read_pos) {
+            // overflow
+            return false;
+        }
+        else {
+            buffer[write_pos] = value;
+            write_pos= next;
+            return true;
+        }
+    }
+
+    // negative = empty
+    int32_t pop() {
+        if (read_pos == write_pos) return -1;
+        int32_t result = buffer[read_pos];
+        read_pos = (read_pos+1)%SIZE;
+        return result;
+    }
+};
+
+}
+
+constexpr uint32_t BUFFER_SIZE = 4096;
+static Fifo<BUFFER_SIZE> webs_fifo;
+
+EM_BOOL WebSocketOpen(int eventType, const EmscriptenWebSocketOpenEvent *e, void *userData)
+{
+    webs_connected = true;
+	printf("open(eventType=%d, userData=%ld)\n", eventType, (long)userData);
+	return 0;
+}
+
+EM_BOOL WebSocketClose(int eventType, const EmscriptenWebSocketCloseEvent *e, void *userData)
+{
+	printf("close(eventType=%d, wasClean=%d, code=%d, reason=%s, userData=%ld)\n", eventType, e->wasClean, e->code, e->reason, (long)userData);
+    webs_closed = true;
+	return 0;
+}
+
+EM_BOOL WebSocketError(int eventType, const EmscriptenWebSocketErrorEvent *e, void *userData)
+{
+	printf("error(eventType=%d, userData=%ld)\n", eventType, (long)userData);
+    webs_closed = true;
+	return 0;
+}
+
+EM_BOOL WebSocketMessage(int eventType, const EmscriptenWebSocketMessageEvent *e, void *userData)
+{
+	printf("message(eventType=%d, userData=%ld, data=%p, numBytes=%d, isText=%d)\n", eventType, (long)userData, e->data, e->numBytes, e->isText);
+    if (webs_closed) return 0;
+	if (e->isText)
+	{
+		printf("text data: \"%s\"\n", e->data);
+	}
+	else
+	{
+        for (int i = 0; i < e->numBytes; ++i) {
+            if (!webs_fifo.push(e->data[i])) {
+                printf("receive buffer overflow");
+                // better stop reception
+                webs_closed=true;
+                break;
+            }
+        }
+	}
+	return 0;
+}
+#endif
+
 bool Socket::Connect( const char* addr, uint16_t port )
 {
+#ifndef __EMSCRIPTEN__
     assert( !IsValid() );
 
     if( m_ptr )
@@ -218,10 +311,50 @@ bool Socket::Connect( const char* addr, uint16_t port )
 
     m_sock.store( sock, std::memory_order_relaxed );
     return true;
+#else
+    if (webs_active_socket>0) {
+        if (webs_connected) {
+            m_sock.store( webs_active_socket, std::memory_order_relaxed );
+        }
+        return webs_connected;
+    } else {
+        char url[256];
+        snprintf(url, sizeof(url), "ws://%s:%d/", addr, port);
+        url[sizeof(url)-1]=0;
+
+        if (!emscripten_websocket_is_supported())
+        {
+            printf("WebSockets are not supported, cannot continue!\n");
+            return false;
+        }
+
+        EmscriptenWebSocketCreateAttributes attr;
+        emscripten_websocket_init_create_attributes(&attr);
+
+        attr.url = url;
+        attr.protocols = "binary,base64"; // We don't really use a special protocol on the server backend in this test, but check that it can be passed.
+
+        EMSCRIPTEN_WEBSOCKET_T socket = emscripten_websocket_new(&attr);
+        if (socket <= 0)
+        {
+            printf("WebSocket creation failed, error code %d!\n", (EMSCRIPTEN_RESULT)socket);
+            return false;
+        }
+        webs_active_socket = socket;
+        webs_connected = false;
+        webs_closed = false;
+        emscripten_websocket_set_onopen_callback(socket, this, WebSocketOpen);
+        emscripten_websocket_set_onclose_callback(socket, this, WebSocketClose);
+        emscripten_websocket_set_onerror_callback(socket, this, WebSocketError);
+        emscripten_websocket_set_onmessage_callback(socket, this, WebSocketMessage);
+        return false;
+    }
+#endif
 }
 
 bool Socket::ConnectBlocking( const char* addr, uint16_t port )
 {
+#ifndef __EMSCRIPTEN__
     assert( !IsValid() );
     assert( !m_ptr );
 
@@ -260,13 +393,21 @@ bool Socket::ConnectBlocking( const char* addr, uint16_t port )
 
     m_sock.store( sock, std::memory_order_relaxed );
     return true;
+#else
+    printf("ConnectBlocking is not implemented");
+    return false;
+#endif
 }
 
 void Socket::Close()
 {
     const auto sock = m_sock.load( std::memory_order_relaxed );
     assert( sock != -1 );
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+    emscripten_websocket_close(sock, 0, 0);
+    emscripten_websocket_delete(sock);
+    webs_active_socket = 0;
+#elif defined _WIN32
     closesocket( sock );
 #else
     close( sock );
@@ -277,8 +418,13 @@ void Socket::Close()
 int Socket::Send( const void* _buf, int len )
 {
     const auto sock = m_sock.load( std::memory_order_relaxed );
-    auto buf = (const char*)_buf;
     assert( sock != -1 );
+#ifdef __EMSCRIPTEN__
+    auto buf = (void*)_buf;
+    auto result = emscripten_websocket_send_binary(sock, buf, len);
+    return result==EMSCRIPTEN_RESULT_SUCCESS ? len : result;
+#else
+    auto buf = (const char*)_buf;
     auto start = buf;
     while( len > 0 )
     {
@@ -288,10 +434,15 @@ int Socket::Send( const void* _buf, int len )
         buf += ret;
     }
     return int( buf - start );
+#endif
 }
 
 int Socket::GetSendBufSize()
 {
+#ifdef __EMSCRIPTEN__
+    // should be a sane default
+    return 4096;
+#else
     const auto sock = m_sock.load( std::memory_order_relaxed );
     int bufSize;
 #if defined _WIN32
@@ -302,6 +453,7 @@ int Socket::GetSendBufSize()
     getsockopt( sock, SOL_SOCKET, SO_SNDBUF, &bufSize, &sz );
 #endif
     return bufSize;
+#endif
 }
 
 int Socket::RecvBuffered( void* buf, int len, int timeout )
@@ -336,6 +488,7 @@ int Socket::RecvBuffered( void* buf, int len, int timeout )
 
 int Socket::Recv( void* _buf, int len, int timeout )
 {
+#ifndef __EMSCRIPTEN__
     const auto sock = m_sock.load( std::memory_order_relaxed );
     auto buf = (char*)_buf;
 
@@ -351,10 +504,31 @@ int Socket::Recv( void* _buf, int len, int timeout )
     {
         return -1;
     }
+#else
+    auto buf = (uint8_t*)_buf;
+    uint32_t received = 0;
+    //double limit = emscripten_get_now() + timeout;
+    auto count = timeout;
+    while (received < len) {
+        int32_t byte = webs_fifo.pop();
+        if (byte>=0) {
+            *buf++ = (uint8_t)byte;
+            ++received;
+        } else {
+            --count;
+            if (webs_closed || !count) // emscripten_get_now()>=limit) 
+                return received > 0 ? received : -1;
+            //emscripten_request_animation_frame_loop();
+            //emscripten_sleep();
+        }
+    }
+    return received;
+#endif
 }
 
 int Socket::ReadUpTo( void* _buf, int len, int timeout )
 {
+#ifndef __EMSCRIPTEN__
     const auto sock = m_sock.load( std::memory_order_relaxed );
     auto buf = (char*)_buf;
 
@@ -369,6 +543,10 @@ int Socket::ReadUpTo( void* _buf, int len, int timeout )
         buf += res;
     }
     return rd;
+#else
+    printf("ReadUpTo is not implemented");
+    return false;
+#endif
 }
 
 bool Socket::Read( void* buf, int len, int timeout )
@@ -406,6 +584,7 @@ bool Socket::ReadImpl( char*& buf, int& len, int timeout )
 
 bool Socket::ReadRaw( void* _buf, int len, int timeout )
 {
+#ifndef __EMSCRIPTEN__
     auto buf = (char*)_buf;
     while( len > 0 )
     {
@@ -415,10 +594,15 @@ bool Socket::ReadRaw( void* _buf, int len, int timeout )
         buf += sz;
     }
     return true;
+#else
+    printf("ConnectBlocking is not implemented");
+    return false;
+#endif
 }
 
 bool Socket::HasData()
 {
+#ifndef __EMSCRIPTEN__
     const auto sock = m_sock.load( std::memory_order_relaxed );
     if( m_bufLeft > 0 ) return true;
 
@@ -427,6 +611,10 @@ bool Socket::HasData()
     fd.events = POLLIN;
 
     return poll( &fd, 1, 0 ) > 0;
+#else
+    printf("HasData is not implemented");
+    return false;
+#endif
 }
 
 bool Socket::IsValid() const
@@ -448,6 +636,7 @@ ListenSocket::~ListenSocket()
     if( m_sock != -1 ) Close();
 }
 
+#ifndef __EMSCRIPTEN__
 static int addrinfo_and_socket_for_family( uint16_t port, int ai_family, struct addrinfo** res )
 {
     struct addrinfo hints;
@@ -468,9 +657,11 @@ static int addrinfo_and_socket_for_family( uint16_t port, int ai_family, struct 
     if (sock == -1) freeaddrinfo( *res );
     return sock;
 }
+#endif
 
 bool ListenSocket::Listen( uint16_t port, int backlog )
 {
+#ifndef __EMSCRIPTEN__
     assert( m_sock == -1 );
 
     struct addrinfo* res = nullptr;
@@ -505,10 +696,14 @@ bool ListenSocket::Listen( uint16_t port, int backlog )
     if( listen( m_sock, backlog ) == -1 ) { freeaddrinfo( res ); Close(); return false; }
     freeaddrinfo( res );
     return true;
+#else
+    return false;
+#endif
 }
 
 Socket* ListenSocket::Accept()
 {
+#ifndef __EMSCRIPTEN__
     struct sockaddr_storage remote;
     socklen_t sz = sizeof( remote );
 
@@ -534,10 +729,14 @@ Socket* ListenSocket::Accept()
     {
         return nullptr;
     }
+#else
+    return nullptr;
+#endif
 }
 
 void ListenSocket::Close()
 {
+#ifndef __EMSCRIPTEN__
     assert( m_sock != -1 );
 #ifdef _WIN32
     closesocket( m_sock );
@@ -545,6 +744,7 @@ void ListenSocket::Close()
     close( m_sock );
 #endif
     m_sock = -1;
+#endif
 }
 
 UdpBroadcast::UdpBroadcast()
@@ -562,6 +762,7 @@ UdpBroadcast::~UdpBroadcast()
 
 bool UdpBroadcast::Open( const char* addr, uint16_t port )
 {
+#ifndef __EMSCRIPTEN__
     assert( m_sock == -1 );
 
     struct addrinfo hints;
@@ -606,10 +807,14 @@ bool UdpBroadcast::Open( const char* addr, uint16_t port )
     m_sock = sock;
     inet_pton( AF_INET, addr, &m_addr );
     return true;
+#else
+    return false;
+#endif
 }
 
 void UdpBroadcast::Close()
 {
+#ifndef __EMSCRIPTEN__
     assert( m_sock != -1 );
 #ifdef _WIN32
     closesocket( m_sock );
@@ -617,16 +822,21 @@ void UdpBroadcast::Close()
     close( m_sock );
 #endif
     m_sock = -1;
+#endif
 }
 
 int UdpBroadcast::Send( uint16_t port, const void* data, int len )
 {
+#ifndef __EMSCRIPTEN__
     assert( m_sock != -1 );
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons( port );
     addr.sin_addr.s_addr = m_addr;
     return sendto( m_sock, (const char*)data, len, MSG_NOSIGNAL, (sockaddr*)&addr, sizeof( addr ) );
+#else
+    return -1;
+#endif
 }
 
 IpAddress::IpAddress()
@@ -641,6 +851,7 @@ IpAddress::~IpAddress()
 
 void IpAddress::Set( const struct sockaddr& addr )
 {
+#ifndef __EMSCRIPTEN__
 #if defined _WIN32 && ( !defined NTDDI_WIN10 || NTDDI_VERSION < NTDDI_WIN10 )
     struct sockaddr_in tmp;
     memcpy( &tmp, &addr, sizeof( tmp ) );
@@ -650,6 +861,7 @@ void IpAddress::Set( const struct sockaddr& addr )
 #endif
     inet_ntop( AF_INET, &ai->sin_addr, m_text, 17 );
     m_number = ai->sin_addr.s_addr;
+#endif
 }
 
 UdpListen::UdpListen()
@@ -667,6 +879,7 @@ UdpListen::~UdpListen()
 
 bool UdpListen::Listen( uint16_t port )
 {
+#ifndef __EMSCRIPTEN__
     assert( m_sock == -1 );
 
     int sock;
@@ -716,10 +929,14 @@ bool UdpListen::Listen( uint16_t port )
 
     m_sock = sock;
     return true;
+#else
+    return false;
+#endif
 }
 
 void UdpListen::Close()
 {
+#ifndef __EMSCRIPTEN__
     assert( m_sock != -1 );
 #ifdef _WIN32
     closesocket( m_sock );
@@ -727,10 +944,12 @@ void UdpListen::Close()
     close( m_sock );
 #endif
     m_sock = -1;
+#endif
 }
 
 const char* UdpListen::Read( size_t& len, IpAddress& addr, int timeout )
 {
+#ifndef __EMSCRIPTEN__
     static char buf[2048];
 
     struct pollfd fd;
@@ -744,6 +963,9 @@ const char* UdpListen::Read( size_t& len, IpAddress& addr, int timeout )
     addr.Set( sa );
 
     return buf;
+#else
+    return nullptr;
+#endif
 }
 
 }

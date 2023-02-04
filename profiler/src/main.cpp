@@ -81,7 +81,7 @@ static std::unique_ptr<tracy::UdpListen> broadcastListen;
 static std::mutex resolvLock;
 static tracy::unordered_flat_map<std::string, std::string> resolvMap;
 static ResolvService resolv( port );
-static char addr[1024] = { "127.0.0.1" };
+static char addr[1024] = { "127.0.0.1:8008" };
 static ConnectionHistory* connHist;
 static std::atomic<ViewShutdown> viewShutdown { ViewShutdown::False };
 static double animTime = 0;
@@ -154,7 +154,7 @@ int main( int argc, char** argv )
 
     std::unique_ptr<tracy::FileRead> initFileOpen;
 #ifdef __EMSCRIPTEN__
-    initFileOpen = std::unique_ptr<tracy::FileRead>( tracy::FileRead::Open( "embed.tracy" ) );
+//    initFileOpen = std::unique_ptr<tracy::FileRead>( tracy::FileRead::Open( "embed.tracy" ) );
 #endif
     if( argc == 2 )
     {
