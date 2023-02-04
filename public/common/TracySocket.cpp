@@ -12,6 +12,7 @@
 
 #ifdef __EMSCRIPTEN__
 #  include <emscripten/websocket.h>
+#  include <poll.h>
 #elif defined _WIN32
 #  ifndef NOMINMAX
 #    define NOMINMAX
@@ -507,17 +508,22 @@ int Socket::Recv( void* _buf, int len, int timeout )
 #else
     auto buf = (uint8_t*)_buf;
     uint32_t received = 0;
-    //double limit = emscripten_get_now() + timeout;
-    auto count = timeout;
+    double limit = emscripten_get_now() + timeout;
+    //auto count = timeout;
     while (received < len) {
         int32_t byte = webs_fifo.pop();
         if (byte>=0) {
             *buf++ = (uint8_t)byte;
             ++received;
         } else {
-            --count;
-            if (webs_closed || !count) // emscripten_get_now()>=limit) 
-                return received > 0 ? received : -1;
+            if (received) return received;
+            //--count;
+            //if (webs_closed || !count)
+            if (webs_closed || emscripten_get_now()>=limit) 
+                return received; // > 0 ? received : -1;
+            struct pollfd fd;
+            // delay
+            poll(&fd, 0, 1);
             //emscripten_request_animation_frame_loop();
             //emscripten_sleep();
         }
